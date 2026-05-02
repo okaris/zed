@@ -173,6 +173,7 @@ members = [
     "crates/schema_generator",
     "crates/search",
     "crates/session",
+    "crates/pty_server",
     "crates/settings",
     "crates/settings_content",
     "crates/settings_json",
@@ -430,6 +431,7 @@ rules_library = { path = "crates/rules_library" }
 scheduler = { path = "crates/scheduler" }
 search = { path = "crates/search" }
 session = { path = "crates/session" }
+pty_server = { path = "crates/pty_server" }
 sidebar = { path = "crates/sidebar" }
 settings = { path = "crates/settings" }
 settings_content = { path = "crates/settings_content" }
