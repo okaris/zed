@@ -361,6 +361,17 @@ pub mod project_panel {
         ]
     );
 }
+pub mod session_panel {
+    use gpui::actions;
+
+    actions!(
+        session_panel,
+        [
+            /// Toggles the session panel.
+            ToggleFocus
+        ]
+    );
+}
 pub mod feedback {
     use gpui::actions;
 

@@ -16046,6 +16046,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "session_panel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "libc",
+ "menu",
+ "project",
+ "pty_server",
+ "serde",
+ "serde_json",
+ "settings",
+ "theme",
+ "ui",
+ "util",
+ "workspace",
+ "zed_actions",
+]
+
+[[package]]
 name = "settings"
 version = "0.1.0"
 dependencies = [
