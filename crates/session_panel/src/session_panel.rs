@@ -697,7 +697,7 @@ impl Panel for SessionPanel {
     }
 
     fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
-        Some(IconName::TerminalAlt)
+        Some(IconName::ListTree)
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
