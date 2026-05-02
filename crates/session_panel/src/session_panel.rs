@@ -1,12 +1,16 @@
+use collections::HashMap;
 use std::path::PathBuf;
 
+use editor::{Editor, EditorEvent};
 use gpui::{
     actions, deferred, div, px, uniform_list, Action, App, AsyncWindowContext, Context,
     DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, Pixels, Render, StatefulInteractiveElement,
-    Styled, Subscription, UniformListScrollHandle, WeakEntity, Window,
+    MouseButton, MouseDownEvent, ParentElement, Pixels, Render, StatefulInteractiveElement, Styled,
+    Subscription, UniformListScrollHandle, WeakEntity, Window,
 };
-use pty_server::{SessionStatus, SessionStore};
+use pty_server::{SessionServer, SessionStatus, SessionStore};
+use task::{RevealStrategy, RevealTarget, Shell, SpawnInTerminal, TaskId};
+use terminal_view::terminal_panel::TerminalPanel;
 use ui::prelude::*;
 use ui::{ContextMenu, IconButton, IconName, Label};
 use workspace::dock::{DockPosition, Panel, PanelEvent};
@@ -68,7 +72,7 @@ pub struct SessionPanel {
     scroll_handle: UniformListScrollHandle,
 
     inline_edit: Option<InlineEdit>,
-    inline_edit_text: String,
+    filename_editor: Entity<Editor>,
 
     context_menu: Option<(Entity<ContextMenu>, gpui::Point<Pixels>, Subscription)>,
 
@@ -78,7 +82,7 @@ pub struct SessionPanel {
 impl SessionPanel {
     pub fn new(
         workspace: &mut Workspace,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
         let workspace_weak = workspace.weak_handle();
@@ -89,6 +93,20 @@ impl SessionPanel {
             let store_path = Self::default_store_path();
             let socket_dir = Self::default_socket_dir();
             let store = SessionStore::load(&store_path).unwrap_or_default();
+
+            let filename_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let editor_subscription = cx.subscribe_in(
+                &filename_editor,
+                window,
+                |session_panel: &mut Self, _, editor_event, window, cx| match editor_event {
+                    EditorEvent::Blurred => {
+                        if session_panel.inline_edit.is_some() {
+                            session_panel.confirm(&Confirm, window, cx);
+                        }
+                    }
+                    _ => {}
+                },
+            );
 
             let mut panel = SessionPanel {
                 focus_handle,
@@ -101,12 +119,11 @@ impl SessionPanel {
                 selected_index: None,
                 scroll_handle: UniformListScrollHandle::new(),
                 inline_edit: None,
-                inline_edit_text: String::new(),
+                filename_editor,
                 context_menu: None,
-                _subscriptions: Vec::new(),
+                _subscriptions: vec![editor_subscription],
             };
 
-            // Expand all groups by default
             for group in &panel.store.groups {
                 panel.expanded_groups.insert(group.id.clone());
             }
@@ -192,48 +209,73 @@ impl SessionPanel {
         cx.notify();
     }
 
-    fn new_group(&mut self, _: &NewGroup, _window: &mut Window, cx: &mut Context<Self>) {
-        self.inline_edit = Some(InlineEdit::NewGroup);
-        self.inline_edit_text.clear();
+    fn start_inline_edit(
+        &mut self,
+        edit: InlineEdit,
+        initial_text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.inline_edit = Some(edit);
+        self.filename_editor.update(cx, |editor, cx| {
+            editor.set_text(initial_text, window, cx);
+            editor.select_all(&editor::actions::SelectAll, window, cx);
+        });
+        window.focus(&self.filename_editor.focus_handle(cx), cx);
         cx.notify();
     }
 
-    fn new_session(&mut self, _: &NewSession, _window: &mut Window, cx: &mut Context<Self>) {
+    fn new_group(&mut self, _: &NewGroup, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_inline_edit(InlineEdit::NewGroup, "", window, cx);
+    }
+
+    fn new_session(&mut self, _: &NewSession, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(group_id) = self.selected_group_id() {
-            self.inline_edit = Some(InlineEdit::NewSession { group_id });
-            self.inline_edit_text.clear();
-            cx.notify();
+            self.start_inline_edit(
+                InlineEdit::NewSession { group_id },
+                "",
+                window,
+                cx,
+            );
         }
     }
 
-    fn rename(&mut self, _: &Rename, _window: &mut Window, cx: &mut Context<Self>) {
+    fn rename(&mut self, _: &Rename, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(index) = self.selected_index {
             if let Some(entry) = self.visible_entries.get(index) {
+                let label = entry.label.clone();
                 match &entry.id {
                     EntryId::Group(group_id) => {
-                        self.inline_edit_text = entry.label.clone();
-                        self.inline_edit = Some(InlineEdit::RenameGroup {
-                            group_id: group_id.clone(),
-                        });
+                        self.start_inline_edit(
+                            InlineEdit::RenameGroup {
+                                group_id: group_id.clone(),
+                            },
+                            &label,
+                            window,
+                            cx,
+                        );
                     }
                     EntryId::Session {
                         group_id,
                         session_id,
                     } => {
-                        self.inline_edit_text = entry.label.clone();
-                        self.inline_edit = Some(InlineEdit::RenameSession {
-                            group_id: group_id.clone(),
-                            session_id: session_id.clone(),
-                        });
+                        self.start_inline_edit(
+                            InlineEdit::RenameSession {
+                                group_id: group_id.clone(),
+                                session_id: session_id.clone(),
+                            },
+                            &label,
+                            window,
+                            cx,
+                        );
                     }
                 }
-                cx.notify();
             }
         }
     }
 
-    fn confirm(&mut self, _: &Confirm, _window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.inline_edit_text.trim().to_string();
+    fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.filename_editor.read(cx).text(cx).trim().to_string();
         if text.is_empty() {
             self.inline_edit = None;
             cx.notify();
@@ -255,7 +297,6 @@ impl SessionPanel {
                 }
             }
             Some(InlineEdit::NewSession { group_id }) => {
-                // Use first preset (Claude Code) by default
                 let preset = self.store.presets.first().cloned();
                 let command = preset
                     .as_ref()
@@ -270,16 +311,35 @@ impl SessionPanel {
                     .map(|g| g.path.clone())
                     .unwrap_or_else(|| PathBuf::from("."));
 
-                if let Ok(_session) = self.store.add_session(
-                    &group_id,
-                    &text,
-                    command,
-                    working_dir,
-                    socket_path,
-                    preset_name,
-                ) {
-                    self.save_store();
-                    self.rebuild_visible_entries();
+                // Spawn the persistent PTY daemon
+                match SessionServer::create(&text, &command, &working_dir, &self.socket_dir) {
+                    Ok(actual_socket_path) => {
+                        if let Ok(_session) = self.store.add_session(
+                            &group_id,
+                            &text,
+                            command.clone(),
+                            working_dir.clone(),
+                            actual_socket_path,
+                            preset_name,
+                        ) {
+                            self.save_store();
+                            self.rebuild_visible_entries();
+                        }
+                    }
+                    Err(_) => {
+                        // Session server failed to start — still store metadata as dead
+                        if let Ok(_session) = self.store.add_session(
+                            &group_id,
+                            &text,
+                            command,
+                            working_dir,
+                            socket_path,
+                            preset_name,
+                        ) {
+                            self.save_store();
+                            self.rebuild_visible_entries();
+                        }
+                    }
                 }
             }
             Some(InlineEdit::RenameSession {
@@ -300,11 +360,14 @@ impl SessionPanel {
             }
             None => {}
         }
+
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
-    fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+    fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
         self.inline_edit = None;
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
@@ -321,6 +384,14 @@ impl SessionPanel {
                         session_id,
                     } => {
                         if let Some(group) = self.store.find_group_mut(group_id) {
+                            // Kill the session server if it's running
+                            if let Some(session) =
+                                group.sessions.iter().find(|s| s.id == *session_id)
+                            {
+                                if session.status == SessionStatus::Running {
+                                    SessionServer::kill_session(&session.socket_path).ok();
+                                }
+                            }
                             group.sessions.retain(|s| s.id != *session_id);
                         }
                     }
@@ -339,6 +410,60 @@ impl SessionPanel {
         match &entry.id {
             EntryId::Group(id) => Some(id.clone()),
             EntryId::Session { group_id, .. } => Some(group_id.clone()),
+        }
+    }
+
+    fn open_session(
+        &self,
+        group_id: &str,
+        session_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let group = match self.store.find_group(group_id) {
+            Some(group) => group,
+            None => return,
+        };
+        let session = match group.sessions.iter().find(|s| s.id == session_id) {
+            Some(session) => session,
+            None => return,
+        };
+
+        let command = session.command.first().cloned();
+        let args: Vec<String> = session.command.iter().skip(1).cloned().collect();
+        let label = session.name.clone();
+        let cwd = Some(session.working_dir.clone());
+        let env: HashMap<String, String> = HashMap::default();
+
+        let spawn = SpawnInTerminal {
+            id: TaskId(label.clone().into()),
+            full_label: label.clone(),
+            label: label.clone(),
+            command,
+            args,
+            command_label: session.command.join(" "),
+            cwd,
+            env,
+            use_new_terminal: true,
+            allow_concurrent_runs: true,
+            reveal: RevealStrategy::Always,
+            reveal_target: RevealTarget::Dock,
+            hide: task::HideStrategy::Never,
+            shell: Shell::System,
+            show_summary: false,
+            show_command: false,
+            show_rerun: false,
+            save: task::SaveStrategy::None,
+        };
+
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                if let Some(terminal_panel) = workspace.panel::<TerminalPanel>(cx) {
+                    terminal_panel
+                        .update(cx, |panel, cx| panel.spawn_task(&spawn, window, cx))
+                        .detach_and_log_err(cx);
+                }
+            });
         }
     }
 
@@ -412,13 +537,21 @@ impl SessionPanel {
             .items_center()
             .gap_1()
             .cursor_pointer()
-            .when(is_selected, |d| d.bg(cx.theme().colors().ghost_element_selected))
+            .when(is_selected, |d| {
+                d.bg(cx.theme().colors().ghost_element_selected)
+            })
             .hover(|d| d.bg(cx.theme().colors().ghost_element_hover))
-            .on_click(cx.listener(move |this, _event, _window, cx| {
+            .on_click(cx.listener(move |this, _event, window, cx| {
                 this.selected_index = Some(index);
-                if is_group {
-                    if let EntryId::Group(ref id) = entry_id {
+                match &entry_id {
+                    EntryId::Group(id) => {
                         this.toggle_group(id, cx);
+                    }
+                    EntryId::Session {
+                        group_id,
+                        session_id,
+                    } => {
+                        this.open_session(group_id, session_id, window, cx);
                     }
                 }
                 cx.notify();
@@ -463,34 +596,14 @@ impl SessionPanel {
             })
     }
 
-    fn render_inline_editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let placeholder = match &self.inline_edit {
-            Some(InlineEdit::NewGroup) => "Group name...",
-            Some(InlineEdit::NewSession { .. }) => "Session name...",
-            Some(InlineEdit::RenameGroup { .. }) => "Rename group...",
-            Some(InlineEdit::RenameSession { .. }) => "Rename session...",
-            None => "",
-        };
-
+    fn render_inline_editor(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .w_full()
             .h(px(28.))
             .px_2()
             .flex()
             .items_center()
-            .child(
-                Label::new(if self.inline_edit_text.is_empty() {
-                    placeholder.to_string()
-                } else {
-                    self.inline_edit_text.clone()
-                })
-                .size(LabelSize::Small)
-                .color(if self.inline_edit_text.is_empty() {
-                    Color::Muted
-                } else {
-                    Color::Default
-                }),
-            )
+            .child(self.filename_editor.clone())
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -508,15 +621,26 @@ impl SessionPanel {
                     .color(Color::Muted),
             )
             .child(
-                IconButton::new("add-group", IconName::Plus)
-                    .icon_size(IconSize::Small)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.new_group(&NewGroup, window, cx);
-                    })),
+                h_flex()
+                    .gap_1()
+                    .child(
+                        IconButton::new("refresh", IconName::ArrowCircle)
+                            .icon_size(IconSize::Small)
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.refresh_statuses(cx);
+                            })),
+                    )
+                    .child(
+                        IconButton::new("add-group", IconName::Plus)
+                            .icon_size(IconSize::Small)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.new_group(&NewGroup, window, cx);
+                            })),
+                    ),
             )
     }
 
-    fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_empty(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .size_full()
             .items_center()
@@ -622,9 +746,9 @@ impl Render for SessionPanel {
                             range
                                 .into_iter()
                                 .filter_map(|ix| {
-                                    entries
-                                        .get(ix)
-                                        .map(|entry| this.render_entry(ix, entry, cx).into_any_element())
+                                    entries.get(ix).map(|entry| {
+                                        this.render_entry(ix, entry, cx).into_any_element()
+                                    })
                                 })
                                 .collect()
                         }),

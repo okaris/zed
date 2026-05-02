@@ -16050,6 +16050,8 @@ name = "session_panel"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "collections",
+ "editor",
  "gpui",
  "libc",
  "menu",
@@ -16058,6 +16060,8 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
+ "task",
+ "terminal_view",
  "theme",
  "ui",
  "util",
