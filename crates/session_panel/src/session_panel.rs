@@ -1,6 +1,7 @@
 use collections::HashMap;
 use std::path::PathBuf;
 
+use editor::{Editor, EditorEvent};
 use gpui::{
     actions, deferred, div, px, uniform_list, Action, App, AsyncWindowContext, Context,
     DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement,
@@ -26,6 +27,8 @@ actions!(
         Rename,
         /// Delete the selected entry.
         Delete,
+        /// Resume the selected dead session via its preset's resume strategy.
+        Resume,
         /// Confirm inline edit (rename/create).
         Confirm,
         /// Cancel inline edit.
@@ -71,7 +74,7 @@ pub struct SessionPanel {
     scroll_handle: UniformListScrollHandle,
 
     inline_edit: Option<InlineEdit>,
-    inline_edit_text: String,
+    filename_editor: Entity<Editor>,
 
     context_menu: Option<(Entity<ContextMenu>, gpui::Point<Pixels>, Subscription)>,
 
@@ -92,7 +95,7 @@ pub fn init(cx: &mut App) {
 impl SessionPanel {
     pub fn new(
         workspace: &mut Workspace,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
         log::info!("[session_panel] new() called");
@@ -111,6 +114,19 @@ impl SessionPanel {
                 store_path
             );
 
+            let filename_editor = cx.new(|cx| Editor::single_line(window, cx));
+            let editor_subscription = cx.subscribe_in(
+                &filename_editor,
+                window,
+                |session_panel: &mut Self, _, editor_event, window, cx| {
+                    if let EditorEvent::Blurred = editor_event {
+                        if session_panel.inline_edit.is_some() {
+                            session_panel.confirm(&Confirm, window, cx);
+                        }
+                    }
+                },
+            );
+
             let mut panel = SessionPanel {
                 focus_handle,
                 workspace: workspace_weak,
@@ -122,9 +138,9 @@ impl SessionPanel {
                 selected_index: None,
                 scroll_handle: UniformListScrollHandle::new(),
                 inline_edit: None,
-                inline_edit_text: String::new(),
+                filename_editor,
                 context_menu: None,
-                _subscriptions: Vec::new(),
+                _subscriptions: vec![editor_subscription],
             };
 
             for group in &panel.store.groups {
@@ -219,48 +235,68 @@ impl SessionPanel {
         cx.notify();
     }
 
-    fn new_group(&mut self, _: &NewGroup, _window: &mut Window, cx: &mut Context<Self>) {
-        self.inline_edit = Some(InlineEdit::NewGroup);
-        self.inline_edit_text.clear();
+    fn start_inline_edit(
+        &mut self,
+        edit: InlineEdit,
+        initial_text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.inline_edit = Some(edit);
+        self.filename_editor.update(cx, |editor, cx| {
+            editor.set_text(initial_text, window, cx);
+            editor.select_all(&editor::actions::SelectAll, window, cx);
+        });
+        window.focus(&self.filename_editor.focus_handle(cx), cx);
         cx.notify();
     }
 
-    fn new_session(&mut self, _: &NewSession, _window: &mut Window, cx: &mut Context<Self>) {
+    fn new_group(&mut self, _: &NewGroup, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_inline_edit(InlineEdit::NewGroup, "", window, cx);
+    }
+
+    fn new_session(&mut self, _: &NewSession, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(group_id) = self.selected_group_id() {
-            self.inline_edit = Some(InlineEdit::NewSession { group_id });
-            self.inline_edit_text.clear();
-            cx.notify();
+            self.start_inline_edit(InlineEdit::NewSession { group_id }, "", window, cx);
         }
     }
 
-    fn rename(&mut self, _: &Rename, _window: &mut Window, cx: &mut Context<Self>) {
+    fn rename(&mut self, _: &Rename, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(index) = self.selected_index {
             if let Some(entry) = self.visible_entries.get(index) {
+                let label = entry.label.clone();
                 match &entry.id {
                     EntryId::Group(group_id) => {
-                        self.inline_edit_text = entry.label.clone();
-                        self.inline_edit = Some(InlineEdit::RenameGroup {
-                            group_id: group_id.clone(),
-                        });
+                        self.start_inline_edit(
+                            InlineEdit::RenameGroup {
+                                group_id: group_id.clone(),
+                            },
+                            &label,
+                            window,
+                            cx,
+                        );
                     }
                     EntryId::Session {
                         group_id,
                         session_id,
                     } => {
-                        self.inline_edit_text = entry.label.clone();
-                        self.inline_edit = Some(InlineEdit::RenameSession {
-                            group_id: group_id.clone(),
-                            session_id: session_id.clone(),
-                        });
+                        self.start_inline_edit(
+                            InlineEdit::RenameSession {
+                                group_id: group_id.clone(),
+                                session_id: session_id.clone(),
+                            },
+                            &label,
+                            window,
+                            cx,
+                        );
                     }
                 }
-                cx.notify();
             }
         }
     }
 
-    fn confirm(&mut self, _: &Confirm, _window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.inline_edit_text.trim().to_string();
+    fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.filename_editor.read(cx).text(cx).trim().to_string();
         if text.is_empty() {
             self.inline_edit = None;
             cx.notify();
@@ -345,11 +381,13 @@ impl SessionPanel {
             }
             None => {}
         }
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
-    fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+    fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
         self.inline_edit = None;
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
@@ -396,56 +434,232 @@ impl SessionPanel {
     }
 
     fn open_session(
-        &self,
+        &mut self,
         group_id: &str,
         session_id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let group = match self.store.find_group(group_id) {
-            Some(group) => group,
-            None => return,
-        };
-        let session = match group.sessions.iter().find(|s| s.id == session_id) {
-            Some(session) => session,
-            None => return,
-        };
+        // Refresh statuses first so we know if the session is alive.
+        self.store.refresh_statuses();
+        self.rebuild_visible_entries();
 
-        let command = session.command.first().cloned();
-        let args: Vec<String> = session.command.iter().skip(1).cloned().collect();
-        let label = session.name.clone();
-        let cwd = Some(session.working_dir.clone());
-        let env: HashMap<String, String> = HashMap::default();
+        let session_status = self
+            .store
+            .find_group(group_id)
+            .and_then(|g| g.sessions.iter().find(|s| s.id == session_id))
+            .map(|s| s.status);
 
-        let spawn = SpawnInTerminal {
-            id: TaskId(label.clone().into()),
-            full_label: label.clone(),
-            label: label.clone(),
-            command,
-            args,
-            command_label: session.command.join(" "),
-            cwd,
-            env,
-            use_new_terminal: true,
-            allow_concurrent_runs: true,
-            reveal: RevealStrategy::Always,
-            reveal_target: RevealTarget::Dock,
-            hide: task::HideStrategy::Never,
-            shell: Shell::System,
-            show_summary: false,
-            show_command: false,
-            show_rerun: false,
-            save: task::SaveStrategy::None,
-        };
+        match session_status {
+            Some(SessionStatus::Running) => {
+                self.spawn_attach_terminal(group_id, session_id, None, window, cx);
+            }
+            Some(SessionStatus::Dead) => {
+                // Capture the frozen scrollback file BEFORE resuming, since
+                // the new daemon will start overwriting it. Snapshot it to a
+                // sibling `.replay` file that the attach client will consume
+                // and delete after dumping. The `.scrollback` file (vs
+                // `.state`) flattens any prior alt-screen content into plain
+                // scrollable text so it survives the alt-screen exit.
+                let replay_path = self
+                    .session_attach_info(group_id, session_id)
+                    .and_then(|(name, socket_path, _)| {
+                        let scrollback_path = socket_path.with_extension("scrollback");
+                        if !scrollback_path.exists() {
+                            return None;
+                        }
+                        let replay_path = self.socket_dir.join(format!("{name}.replay"));
+                        std::fs::copy(&scrollback_path, &replay_path).ok()?;
+                        Some(replay_path)
+                    });
 
-        if let Some(workspace) = self.workspace.upgrade() {
-            workspace.update(cx, |workspace, cx| {
-                if let Some(terminal_panel) = workspace.panel::<TerminalPanel>(cx) {
-                    terminal_panel
-                        .update(cx, |panel, cx| panel.spawn_task(&spawn, window, cx))
-                        .detach_and_log_err(cx);
+                if !self.try_resume_session(group_id, session_id) {
+                    log::warn!("[session_panel] resume failed; nothing to attach to");
+                    self.rebuild_visible_entries();
+                    cx.notify();
+                    return;
                 }
-            });
+                self.rebuild_visible_entries();
+                self.spawn_attach_terminal(group_id, session_id, replay_path, window, cx);
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// Spawn a terminal tab attached to a live session via `pty-server attach`.
+    /// If `replay_path` is provided, the attach client dumps that file's bytes
+    /// as scrollback before connecting — used to carry forward the previous
+    /// session's frozen state when resuming a dead session.
+    fn spawn_attach_terminal(
+        &self,
+        group_id: &str,
+        session_id: &str,
+        replay_path: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((label, socket_path, working_dir)) =
+            self.session_attach_info(group_id, session_id)
+        else {
+            return;
+        };
+        let pty_server_bin = locate_pty_server_binary();
+
+        let mut args: Vec<String> = vec!["attach".into()];
+        if let Some(path) = replay_path.as_ref() {
+            args.push("--replay".into());
+            args.push(path.to_string_lossy().into_owned());
+            args.push("--delete-replay".into());
+        }
+        args.push(socket_path.to_string_lossy().into_owned());
+
+        let command_label = format!("{} {}", pty_server_bin.display(), args.join(" "));
+        log::info!(
+            "[session_panel] attaching to '{}' via {} ({})",
+            label,
+            pty_server_bin.display(),
+            socket_path.display()
+        );
+        self.run_in_terminal_panel(
+            SpawnInTerminal {
+                id: TaskId(format!("attach:{label}").into()),
+                full_label: label.clone(),
+                label,
+                command: Some(pty_server_bin.to_string_lossy().into_owned()),
+                args,
+                command_label,
+                cwd: Some(working_dir),
+                env: HashMap::default(),
+                use_new_terminal: true,
+                allow_concurrent_runs: true,
+                reveal: RevealStrategy::Always,
+                reveal_target: RevealTarget::Dock,
+                hide: task::HideStrategy::Never,
+                shell: Shell::System,
+                show_summary: false,
+                show_command: false,
+                show_rerun: false,
+                save: task::SaveStrategy::None,
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn session_attach_info(
+        &self,
+        group_id: &str,
+        session_id: &str,
+    ) -> Option<(String, PathBuf, PathBuf)> {
+        let group = self.store.find_group(group_id)?;
+        let session = group.sessions.iter().find(|s| s.id == session_id)?;
+        Some((
+            session.name.clone(),
+            session.socket_path.clone(),
+            session.working_dir.clone(),
+        ))
+    }
+
+    fn run_in_terminal_panel(
+        &self,
+        spawn: SpawnInTerminal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let terminal_panel = workspace.read(cx).panel::<TerminalPanel>(cx);
+        let Some(terminal_panel) = terminal_panel else {
+            log::warn!("[session_panel] terminal panel not available");
+            return;
+        };
+        terminal_panel
+            .update(cx, |panel, cx| panel.spawn_task(&spawn, window, cx))
+            .detach_and_log_err(cx);
+    }
+
+    fn resume(&mut self, _: &Resume, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.selected_index else {
+            return;
+        };
+        let Some(entry) = self.visible_entries.get(index).cloned() else {
+            return;
+        };
+        let EntryId::Session {
+            group_id,
+            session_id,
+        } = entry.id
+        else {
+            return;
+        };
+        if self.try_resume_session(&group_id, &session_id) {
+            self.rebuild_visible_entries();
+            cx.notify();
+        }
+    }
+
+    /// Try to resume a dead session using its preset's resume strategy
+    /// (or relaunch with the original command if no preset). Returns true
+    /// if the session is now alive.
+    fn try_resume_session(&mut self, group_id: &str, session_id: &str) -> bool {
+        // Snapshot needed values
+        let socket_dir = self.socket_dir.clone();
+        let (session_name, working_dir, original_command, preset_name, old_socket) = {
+            let Some(group) = self.store.find_group(group_id) else {
+                return false;
+            };
+            let Some(session) = group.sessions.iter().find(|s| s.id == session_id) else {
+                return false;
+            };
+            (
+                session.name.clone(),
+                session.working_dir.clone(),
+                session.command.clone(),
+                session.preset.clone(),
+                session.socket_path.clone(),
+            )
+        };
+
+        // Choose command: preset's resume command if available, else the original command.
+        let command = preset_name
+            .as_deref()
+            .and_then(|name| self.store.find_preset(name))
+            .and_then(|preset| preset.resume_command(&session_name, &working_dir))
+            .map(|mut cmd| {
+                for arg in cmd.iter_mut() {
+                    *arg = arg.replace("{session_id}", &session_name);
+                }
+                cmd
+            })
+            .unwrap_or(original_command);
+
+        // Clean up any stale socket file
+        std::fs::remove_file(&old_socket).ok();
+
+        log::info!(
+            "[session_panel] resuming session '{session_name}' with cmd={command:?}"
+        );
+
+        match SessionServer::create(&session_name, &command, &working_dir, &socket_dir) {
+            Ok(new_socket_path) => {
+                if let Some(group) = self.store.find_group_mut(group_id) {
+                    if let Some(session) =
+                        group.sessions.iter_mut().find(|s| s.id == session_id)
+                    {
+                        session.socket_path = new_socket_path;
+                        session.status = SessionStatus::Running;
+                        session.command = command;
+                    }
+                }
+                self.save_store();
+                true
+            }
+            Err(e) => {
+                log::error!("[session_panel] resume failed for '{session_name}': {e}");
+                false
+            }
         }
     }
 
@@ -453,6 +667,137 @@ impl SessionPanel {
         self.store.refresh_statuses();
         self.rebuild_visible_entries();
         cx.notify();
+    }
+
+    fn deploy_preset_picker(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let presets: Vec<(String, Option<String>)> = self
+            .store
+            .presets
+            .iter()
+            .map(|p| (p.name.clone(), p.description.clone()))
+            .collect();
+
+        let weak_self = cx.weak_entity();
+
+        let context_menu = ContextMenu::build(window, cx, |menu, _window, _cx| {
+            let mut menu = menu;
+            for (preset_name, description) in presets {
+                let label = match description {
+                    Some(desc) => format!("{preset_name} — {desc}"),
+                    None => preset_name.clone(),
+                };
+                let weak = weak_self.clone();
+                menu = menu.entry(label, None, move |window, cx| {
+                    let preset_name = preset_name.clone();
+                    weak.update(cx, |this, cx| {
+                        this.create_session_with_preset(&preset_name, window, cx);
+                    })
+                    .ok();
+                });
+            }
+            menu
+        });
+
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe(&context_menu, |this, _, _: &DismissEvent, cx| {
+            this.context_menu.take();
+            cx.notify();
+        });
+        self.context_menu = Some((context_menu, position, subscription));
+        cx.notify();
+    }
+
+    fn create_session_with_preset(
+        &mut self,
+        preset_name: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let preset = match self.store.find_preset(preset_name).cloned() {
+            Some(p) => p,
+            None => {
+                log::warn!("[session_panel] preset not found: {preset_name}");
+                return;
+            }
+        };
+
+        // Ensure a default group exists
+        let group_id = if let Some(group) = self.store.groups.first() {
+            group.id.clone()
+        } else {
+            let group = self.store.create_group("Sessions", PathBuf::from("."));
+            self.expanded_groups.insert(group.id.clone());
+            group.id.clone()
+        };
+
+        let working_dir = self
+            .store
+            .find_group(&group_id)
+            .map(|g| g.path.clone())
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        // Auto-generate a name like "claude-1", "claude-2"
+        let session_name = self.next_session_name(&preset.binary, &group_id);
+
+        let mut command = preset.launch_command();
+        // Replace {session_id} placeholders
+        for arg in command.iter_mut() {
+            *arg = arg.replace("{session_id}", &session_name);
+        }
+
+        log::info!(
+            "[session_panel] creating session '{}' with preset '{}', cmd={:?}",
+            session_name,
+            preset.name,
+            command
+        );
+
+        match SessionServer::create(&session_name, &command, &working_dir, &self.socket_dir) {
+            Ok(socket_path) => {
+                if let Ok(_) = self.store.add_session(
+                    &group_id,
+                    &session_name,
+                    command,
+                    working_dir,
+                    socket_path,
+                    Some(preset.name.clone()),
+                ) {
+                    self.save_store();
+                    self.rebuild_visible_entries();
+                    cx.notify();
+                }
+            }
+            Err(e) => {
+                log::error!(
+                    "[session_panel] failed to spawn session server '{session_name}': {e}"
+                );
+            }
+        }
+    }
+
+    fn next_session_name(&self, binary: &str, group_id: &str) -> String {
+        let prefix = std::path::Path::new(binary)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("session")
+            .to_string();
+        let group = match self.store.find_group(group_id) {
+            Some(g) => g,
+            None => return format!("{prefix}-1"),
+        };
+        let mut n = 1;
+        loop {
+            let candidate = format!("{prefix}-{n}");
+            if !group.sessions.iter().any(|s| s.name == candidate) {
+                return candidate;
+            }
+            n += 1;
+        }
     }
 
     fn deploy_context_menu(
@@ -473,9 +818,13 @@ impl SessionPanel {
                         .separator()
                         .action("Delete Group", Box::new(Delete))
                 } else {
-                    menu.action("Rename Session", Box::new(Rename))
-                        .separator()
-                        .action("Delete Session", Box::new(Delete))
+                    let menu = menu.action("Rename Session", Box::new(Rename));
+                    let menu = if entry.status == Some(SessionStatus::Dead) {
+                        menu.separator().action("Resume Session", Box::new(Resume))
+                    } else {
+                        menu
+                    };
+                    menu.separator().action("Delete Session", Box::new(Delete))
                 }
             });
             menu
@@ -579,33 +928,13 @@ impl SessionPanel {
     }
 
     fn render_inline_editor(&self, _cx: &mut Context<Self>) -> impl IntoElement {
-        let placeholder = match &self.inline_edit {
-            Some(InlineEdit::NewGroup) => "Group name...",
-            Some(InlineEdit::NewSession { .. }) => "Session name...",
-            Some(InlineEdit::RenameGroup { .. }) => "Rename group...",
-            Some(InlineEdit::RenameSession { .. }) => "Rename session...",
-            None => "",
-        };
-
         div()
             .w_full()
             .h(px(28.))
             .px_2()
             .flex()
             .items_center()
-            .child(
-                Label::new(if self.inline_edit_text.is_empty() {
-                    placeholder.to_string()
-                } else {
-                    self.inline_edit_text.clone()
-                })
-                .size(LabelSize::Small)
-                .color(if self.inline_edit_text.is_empty() {
-                    Color::Muted
-                } else {
-                    Color::Default
-                }),
-            )
+            .child(self.filename_editor.clone())
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -633,10 +962,11 @@ impl SessionPanel {
                             })),
                     )
                     .child(
-                        IconButton::new("add-group", IconName::Plus)
+                        IconButton::new("new-session", IconName::Plus)
                             .icon_size(IconSize::Small)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.new_group(&NewGroup, window, cx);
+                            .tooltip(ui::Tooltip::text("New Session"))
+                            .on_click(cx.listener(|this, event: &gpui::ClickEvent, window, cx| {
+                                this.deploy_preset_picker(event.position(), window, cx);
                             })),
                     ),
             )
@@ -733,6 +1063,7 @@ impl Render for SessionPanel {
             .on_action(cx.listener(Self::new_session))
             .on_action(cx.listener(Self::rename))
             .on_action(cx.listener(Self::delete))
+            .on_action(cx.listener(Self::resume))
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::cancel))
             .child(self.render_header(cx))
@@ -765,4 +1096,18 @@ impl Render for SessionPanel {
                 deferred(menu.clone().into_any_element())
             }))
     }
+}
+
+/// Locate the pty-server binary. Looks for it next to the running zed binary
+/// first (development build), then falls back to PATH lookup.
+fn locate_pty_server_binary() -> PathBuf {
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(dir) = current_exe.parent() {
+            let candidate = dir.join("pty-server");
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from("pty-server")
 }

@@ -12,6 +12,16 @@ use nix::unistd::{self, ForkResult, Pid};
 use crate::protocol::{Packet, PacketType};
 
 const READ_BUF_SIZE: usize = 8192;
+/// Default screen size before any client attaches.
+const DEFAULT_ROWS: u16 = 24;
+const DEFAULT_COLS: u16 = 80;
+/// Scrollback line capacity for the virtual terminal (lines, not bytes).
+/// 5000 lines covers long shell histories without unbounded memory growth.
+const SCROLLBACK_LINES: usize = 5000;
+/// How often to flush a frozen-replay snapshot to disk while the session is
+/// active. Trades disk traffic for "how stale is the post-crash snapshot".
+const STATE_PERSIST_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(5);
 
 /// Represents a running session server that holds a PTY alive.
 pub struct SessionServer {
@@ -102,7 +112,12 @@ impl SessionServer {
                 Ok(socket_path)
             }
             ForkResult::Child => {
+                // Detach from parent: new session, redirect stdio so this
+                // process truly outlives the parent (Zed). stderr goes to a
+                // per-session log file for diagnostics.
                 unistd::setsid().ok();
+                let log_path = socket_dir.join(format!("{session_name}.log"));
+                redirect_stdio(&log_path);
 
                 let (master, slave) = openpty_libc()?;
 
@@ -181,11 +196,21 @@ impl SessionServer {
 
         let mut clients: Vec<ClientConn> = Vec::new();
         let mut pty_buf = [0u8; READ_BUF_SIZE];
+        let mut history = History::new(DEFAULT_ROWS, DEFAULT_COLS, SCROLLBACK_LINES);
+        let mut state_dirty = false;
+        let mut last_state_write = std::time::Instant::now();
+
+        eprintln!(
+            "session '{}' started; socket={}",
+            self.session_name,
+            self.socket_path.display(),
+        );
 
         loop {
             // Check if child is still alive
             match waitpid(self.child_pid, Some(WaitPidFlag::WNOHANG)) {
                 Ok(WaitStatus::Exited(_, status)) => {
+                    persist_history(&self.socket_path, &history).ok();
                     let exit_packet = Packet::exit(status);
                     for client in &mut clients {
                         exit_packet.write_to(&mut client.stream).ok();
@@ -194,6 +219,7 @@ impl SessionServer {
                     return Ok(());
                 }
                 Ok(WaitStatus::Signaled(_, signal, _)) => {
+                    persist_history(&self.socket_path, &history).ok();
                     let exit_packet = Packet::exit(128 + signal as i32);
                     for client in &mut clients {
                         exit_packet.write_to(&mut client.stream).ok();
@@ -206,8 +232,17 @@ impl SessionServer {
 
             // Check if socket file was removed (external kill signal)
             if !self.socket_path.exists() {
+                persist_history(&self.socket_path, &history).ok();
                 signal::kill(self.child_pid, Signal::SIGTERM).ok();
                 return Ok(());
+            }
+
+            // Periodically flush state to disk so frozen replay survives crashes.
+            if state_dirty && last_state_write.elapsed() >= STATE_PERSIST_INTERVAL {
+                if persist_history(&self.socket_path, &history).is_ok() {
+                    state_dirty = false;
+                    last_state_write = std::time::Instant::now();
+                }
             }
 
             // Build poll fd list: [pty, listener, client0, client1, ...]
@@ -220,8 +255,12 @@ impl SessionServer {
 
             // Accept new client connections
             if ready.get(1).copied().unwrap_or(false) {
-                if let Ok((stream, _)) = listener.accept() {
+                if let Ok((mut stream, _)) = listener.accept() {
                     stream.set_nonblocking(false).ok();
+                    let replay = history.snapshot_for_replay();
+                    if !replay.is_empty() {
+                        Packet::content(&replay).write_to(&mut stream).ok();
+                    }
                     clients.push(ClientConn { stream });
                 }
             }
@@ -238,7 +277,10 @@ impl SessionServer {
                         return Ok(());
                     }
                     n => {
-                        let packet = Packet::content(&pty_buf[..n as usize]);
+                        let chunk = &pty_buf[..n as usize];
+                        history.record(chunk);
+                        state_dirty = true;
+                        let packet = Packet::content(chunk);
                         clients.retain_mut(|client| {
                             packet.write_to(&mut client.stream).is_ok()
                         });
@@ -275,6 +317,7 @@ impl SessionServer {
                                 unsafe {
                                     libc::ioctl(pty_fd, libc::TIOCSWINSZ, &ws);
                                 }
+                                history.resize(rows, cols);
                             }
                         }
                         PacketType::Detach => {
@@ -344,6 +387,83 @@ impl SessionServer {
     }
 }
 
+/// Detach the daemon from its parent's stdio. stdin/stdout go to /dev/null,
+/// stderr goes to a per-session log file so server diagnostics are visible.
+/// Path of the live-replay snapshot file for a given session socket.
+pub fn state_path_for(socket_path: &Path) -> PathBuf {
+    socket_path.with_extension("state")
+}
+
+/// Path of the resume-scrollback file for a given session socket. Used to
+/// give a freshly-resumed dead session its prior context as scrollback.
+pub fn scrollback_path_for(socket_path: &Path) -> PathBuf {
+    socket_path.with_extension("scrollback")
+}
+
+/// Atomic file write: tmp + rename, so a partial write never corrupts the
+/// previous file — if we crash mid-write, readers still see the last good
+/// version.
+fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut tmp = path.to_path_buf();
+    let mut tmp_name = tmp
+        .file_name()
+        .map(|n| n.to_owned())
+        .unwrap_or_default();
+    tmp_name.push(".tmp");
+    tmp.set_file_name(tmp_name);
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Persist both the live-replay state and the resume-scrollback to disk.
+fn persist_history(socket_path: &Path, history: &History) -> io::Result<()> {
+    write_atomic(&state_path_for(socket_path), &history.snapshot_for_replay())?;
+    write_atomic(
+        &scrollback_path_for(socket_path),
+        &history.snapshot_for_resume(),
+    )?;
+    Ok(())
+}
+
+fn redirect_stdio(log_path: &Path) {
+    let devnull = std::ffi::CString::new("/dev/null").expect("static cstring");
+    unsafe {
+        let read_fd = libc::open(devnull.as_ptr(), libc::O_RDONLY);
+        if read_fd >= 0 {
+            libc::dup2(read_fd, 0);
+            if read_fd != 0 {
+                libc::close(read_fd);
+            }
+        }
+        let write_fd = libc::open(devnull.as_ptr(), libc::O_WRONLY);
+        if write_fd >= 0 {
+            libc::dup2(write_fd, 1);
+            if write_fd > 1 {
+                libc::close(write_fd);
+            }
+        }
+    }
+    if let Some(c_path) = log_path
+        .to_str()
+        .and_then(|s| std::ffi::CString::new(s).ok())
+    {
+        unsafe {
+            let log_fd = libc::open(
+                c_path.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+                0o644,
+            );
+            if log_fd >= 0 {
+                libc::dup2(log_fd, 2);
+                if log_fd != 2 {
+                    libc::close(log_fd);
+                }
+            }
+        }
+    }
+}
+
 fn setup_slave_and_exec(slave: &OwnedFd, working_dir: &Path, command: &[String]) -> ! {
     let slave_fd = slave.as_raw_fd();
     unistd::setsid().ok();
@@ -379,6 +499,98 @@ fn setup_slave_and_exec(slave: &OwnedFd, working_dir: &Path, command: &[String])
 
 struct ClientConn {
     stream: std::os::unix::net::UnixStream,
+}
+
+/// Tracks the recordable history of a session so new clients can be brought
+/// up to speed on attach.
+///
+/// We maintain two complementary models of past output:
+///
+/// * A virtual terminal (`vt100::Parser`) — gives us the *current* screen
+///   state, including alt-screen contents, cursor position, and attributes.
+///   On reattach we serialize this so TUIs (vim, claude, htop) render
+///   correctly even though the alt screen has no real "history".
+///
+/// * A byte log of main-screen output — replayed verbatim so that shell
+///   command history scrolls into the new client's terminal. Alt-screen
+///   bytes are deliberately excluded so vim/claude redraws don't pollute
+///   the scrollback or flicker on reattach.
+struct History {
+    parser: vt100::Parser,
+    main_log: Vec<u8>,
+}
+
+impl History {
+    fn new(rows: u16, cols: u16, scrollback_lines: usize) -> Self {
+        Self {
+            parser: vt100::Parser::new(rows, cols, scrollback_lines),
+            main_log: Vec::new(),
+        }
+    }
+
+    /// Record a chunk of bytes emitted by the PTY.
+    fn record(&mut self, chunk: &[u8]) {
+        let was_alt_screen = self.parser.screen().alternate_screen();
+        self.parser.process(chunk);
+        let is_alt_screen = self.parser.screen().alternate_screen();
+
+        // Only chunks that stayed entirely in main-screen mode contribute to
+        // replayable scrollback. Transition chunks are treated as alt-screen
+        // because they contain the screen-switch escape; the next chunk that
+        // returns to main will start cleanly.
+        if !was_alt_screen && !is_alt_screen {
+            self.main_log.extend_from_slice(chunk);
+        }
+    }
+
+    /// Resize the virtual terminal to match an attached client.
+    fn resize(&mut self, rows: u16, cols: u16) {
+        self.parser.screen_mut().set_size(rows, cols);
+    }
+
+    /// Build the bytes to send a freshly-attached client so it sees the
+    /// session in its current state, with scrollback.
+    ///
+    /// Strategy: always replay the main-screen history first so the client's
+    /// terminal has scrollable shell context. Then, if a TUI app is currently
+    /// running, layer alt-screen on top of that — `\x1b[?1049h` switches the
+    /// terminal into alt-screen (preserving main beneath) and we follow with
+    /// the TUI's current screen state. When the TUI exits, the host terminal
+    /// drops back to main and the shell history is right there waiting.
+    fn snapshot_for_replay(&self) -> Vec<u8> {
+        let mut bytes = self.main_log.clone();
+        if self.parser.screen().alternate_screen() {
+            bytes.extend_from_slice(b"\x1b[?1049h");
+            bytes.extend_from_slice(&self.parser.screen().contents_formatted());
+        }
+        bytes
+    }
+
+    /// Build the bytes to replay as scrollback when *resuming* a dead session
+    /// — i.e. when a fresh shell will run after the replay.
+    ///
+    /// Unlike `snapshot_for_replay`, this never enters alt-screen mode. If
+    /// the dead session ended with a TUI app on screen, the TUI's text is
+    /// flattened into plain text (via `vt100::Screen::contents()`) and
+    /// appended to main_log so the user can scroll up and read it. We trade
+    /// styling/cursor fidelity for the ability to keep this content visible
+    /// in the new live shell's scrollback.
+    fn snapshot_for_resume(&self) -> Vec<u8> {
+        let mut bytes = self.main_log.clone();
+        if self.parser.screen().alternate_screen() {
+            let alt_text = self.parser.screen().contents();
+            if !alt_text.is_empty() {
+                bytes.extend_from_slice(b"\r\n");
+                // Translate plain newlines to CRLF so the receiving terminal
+                // (in raw-ish mode) lays out lines correctly.
+                for line in alt_text.split('\n') {
+                    bytes.extend_from_slice(line.as_bytes());
+                    bytes.extend_from_slice(b"\r\n");
+                }
+            }
+        }
+        bytes
+    }
 }
 
 impl Drop for SessionServer {
