@@ -16051,9 +16051,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "collections",
- "editor",
  "gpui",
  "libc",
+ "log",
  "menu",
  "project",
  "pty_server",

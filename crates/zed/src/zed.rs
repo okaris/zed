@@ -5397,6 +5397,7 @@ mod tests {
             git_ui::init(cx);
             project_panel::init(cx);
             outline_panel::init(cx);
+            session_panel::init(cx);
             terminal_view::init(cx);
             copilot_chat::init(
                 app_state.fs.clone(),

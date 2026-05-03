@@ -15,9 +15,9 @@ doctest = false
 [dependencies]
 anyhow.workspace = true
 collections.workspace = true
-editor.workspace = true
 gpui.workspace = true
 libc.workspace = true
+log.workspace = true
 menu.workspace = true
 project.workspace = true
 pty_server.workspace = true
