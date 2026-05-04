@@ -33,6 +33,8 @@ actions!(
         Confirm,
         /// Cancel inline edit.
         Cancel,
+        /// Toggle visibility of the session-list sidebar.
+        ToggleSidebar,
     ]
 );
 
@@ -76,6 +78,15 @@ pub struct SessionPanel {
     inline_edit: Option<InlineEdit>,
     filename_editor: Entity<Editor>,
 
+    /// The terminal panel we host. Replaces Zed's stand-alone TerminalPanel
+    /// in the bottom dock — we own the only instance, render it as the right
+    /// pane of our split, and forward session-driven terminal spawns to it.
+    terminal_panel: Entity<TerminalPanel>,
+    /// Whether the session-list sidebar is visible. When collapsed, our panel
+    /// renders only the embedded terminal panel (visually identical to the
+    /// bare terminal panel), so users never lose that affordance.
+    sidebar_collapsed: bool,
+
     context_menu: Option<(Entity<ContextMenu>, gpui::Point<Pixels>, Subscription)>,
 
     _subscriptions: Vec<Subscription>,
@@ -95,6 +106,7 @@ pub fn init(cx: &mut App) {
 impl SessionPanel {
     pub fn new(
         workspace: &mut Workspace,
+        terminal_panel: Entity<TerminalPanel>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
@@ -139,6 +151,8 @@ impl SessionPanel {
                 scroll_handle: UniformListScrollHandle::new(),
                 inline_edit: None,
                 filename_editor,
+                terminal_panel,
+                sidebar_collapsed: false,
                 context_menu: None,
                 _subscriptions: vec![editor_subscription],
             };
@@ -158,8 +172,11 @@ impl SessionPanel {
         mut cx: AsyncWindowContext,
     ) -> anyhow::Result<Entity<Self>> {
         log::info!("[session_panel] load() starting");
+        // Load the embedded terminal panel first; our panel owns the only
+        // instance and renders it inline.
+        let terminal_panel = TerminalPanel::load(workspace.clone(), cx.clone()).await?;
         let result = workspace.update_in(&mut cx, |workspace, window, cx| {
-            Self::new(workspace, window, cx)
+            Self::new(workspace, terminal_panel, window, cx)
         });
         match &result {
             Ok(_) => log::info!("[session_panel] load() succeeded"),
@@ -391,6 +408,16 @@ impl SessionPanel {
         cx.notify();
     }
 
+    fn toggle_sidebar(
+        &mut self,
+        _: &ToggleSidebar,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sidebar_collapsed = !self.sidebar_collapsed;
+        cx.notify();
+    }
+
     fn delete(&mut self, _: &Delete, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(index) = self.selected_index {
             if let Some(entry) = self.visible_entries.get(index) {
@@ -567,15 +594,8 @@ impl SessionPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(workspace) = self.workspace.upgrade() else {
-            return;
-        };
-        let terminal_panel = workspace.read(cx).panel::<TerminalPanel>(cx);
-        let Some(terminal_panel) = terminal_panel else {
-            log::warn!("[session_panel] terminal panel not available");
-            return;
-        };
-        terminal_panel
+        // The terminal panel is embedded in our panel — call it directly.
+        self.terminal_panel
             .update(cx, |panel, cx| panel.spawn_task(&spawn, window, cx))
             .detach_and_log_err(cx);
     }
@@ -1009,11 +1029,16 @@ impl Panel for SessionPanel {
     }
 
     fn position(&self, _window: &Window, _cx: &App) -> DockPosition {
-        DockPosition::Right
+        DockPosition::Bottom
     }
 
     fn position_is_valid(&self, position: DockPosition) -> bool {
-        matches!(position, DockPosition::Left | DockPosition::Right)
+        // Allow Bottom (default — full-width terminal area) or Left/Right
+        // for users who prefer a vertical layout.
+        matches!(
+            position,
+            DockPosition::Bottom | DockPosition::Left | DockPosition::Right
+        )
     }
 
     fn set_position(
@@ -1025,11 +1050,11 @@ impl Panel for SessionPanel {
     }
 
     fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
-        px(260.)
+        px(360.)
     }
 
     fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
-        Some(IconName::ListTree)
+        Some(IconName::TerminalAlt)
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
@@ -1049,23 +1074,17 @@ impl Panel for SessionPanel {
     }
 }
 
-impl Render for SessionPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        log::info!("[session_panel] render() called, entries={}", self.visible_entries.len());
+impl SessionPanel {
+    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let entry_count = self.visible_entries.len();
         let has_entries = entry_count > 0;
         let has_inline_edit = self.inline_edit.is_some();
 
         v_flex()
-            .size_full()
-            .track_focus(&self.focus_handle(cx))
-            .on_action(cx.listener(Self::new_group))
-            .on_action(cx.listener(Self::new_session))
-            .on_action(cx.listener(Self::rename))
-            .on_action(cx.listener(Self::delete))
-            .on_action(cx.listener(Self::resume))
-            .on_action(cx.listener(Self::confirm))
-            .on_action(cx.listener(Self::cancel))
+            .h_full()
+            .w(px(240.))
+            .border_r_1()
+            .border_color(cx.theme().colors().border)
             .child(self.render_header(cx))
             .when(!has_entries && !has_inline_edit, |d| {
                 d.child(self.render_empty(cx))
@@ -1092,6 +1111,64 @@ impl Render for SessionPanel {
                 )
             })
             .when(has_inline_edit, |d| d.child(self.render_inline_editor(cx)))
+    }
+
+    fn render_sidebar_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let icon = if self.sidebar_collapsed {
+            IconName::ChevronRight
+        } else {
+            IconName::ChevronLeft
+        };
+        let tooltip = if self.sidebar_collapsed {
+            "Show Sessions"
+        } else {
+            "Hide Sessions"
+        };
+        IconButton::new("toggle-sidebar", icon)
+            .icon_size(IconSize::Small)
+            .tooltip(ui::Tooltip::text(tooltip))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.toggle_sidebar(&ToggleSidebar, window, cx);
+            }))
+    }
+}
+
+impl Render for SessionPanel {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        log::info!(
+            "[session_panel] render() called, entries={} sidebar_collapsed={}",
+            self.visible_entries.len(),
+            self.sidebar_collapsed,
+        );
+
+        h_flex()
+            .size_full()
+            .track_focus(&self.focus_handle(cx))
+            .on_action(cx.listener(Self::new_group))
+            .on_action(cx.listener(Self::new_session))
+            .on_action(cx.listener(Self::rename))
+            .on_action(cx.listener(Self::delete))
+            .on_action(cx.listener(Self::resume))
+            .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::toggle_sidebar))
+            .when(!self.sidebar_collapsed, |this| {
+                this.child(self.render_sidebar(cx))
+            })
+            .child(
+                v_flex()
+                    .size_full()
+                    .child(
+                        h_flex()
+                            .h(px(28.))
+                            .px_2()
+                            .gap_1()
+                            .border_b_1()
+                            .border_color(cx.theme().colors().border)
+                            .child(self.render_sidebar_toggle(cx)),
+                    )
+                    .child(self.terminal_panel.clone()),
+            )
             .children(self.context_menu.as_ref().map(|(menu, _position, _)| {
                 deferred(menu.clone().into_any_element())
             }))

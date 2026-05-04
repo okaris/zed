@@ -33,22 +33,54 @@ Remote: Zed → RPC → zed-remote-server (includes pty_server) → PTY on remot
 ## Status
 
 ### Done
-- [x] **Phase 1: pty_server core** (`crates/pty_server/`, ~800 lines, 25 tests)
-  - PTY holding: fork + openpty + unix socket + poll loop
+- [x] **Phase 1: pty_server core** (`crates/pty_server/`)
+  - PTY holding: double-fork + openpty + unix socket + poll loop
+  - Daemons survive Zed crashes: stdin/stdout to /dev/null, stderr to per-session log file
   - Client attach/detach with protocol (versioned packets)
-  - Session survives Zed close, reattach works
-  - CLI binary for testing: `pty-server create/attach/list/kill`
+  - CLI binary `pty-server create/attach/list/kill/view`
 - [x] **Phase 2: Metadata & Agent Presets**
-  - JSON-based session/group persistence
+  - JSON-based session/group persistence (`~/.config/zed-sessions/sessions.json`)
   - Session liveness detection via socket probe
   - Agent preset system with per-agent launch/resume definitions
   - Built-in presets: Claude Code, Codex, Gemini, Copilot, Amp, Terminal
   - Resume strategies: `none`, `continue_in_directory`, `resume_by_id`
+- [x] **Phase 3: Session Panel UI** (`crates/session_panel/`)
+  - Tree view with groups → sessions, status indicators (running/dead)
+  - Right-click context menus (rename, delete, resume)
+  - **+** opens an agent preset picker; auto-names sessions (`claude-1`, `zsh-2`)
+  - Inline rename via `Editor::single_line`
+  - Click on dead session → auto-resume via preset's resume strategy
+- [x] **Phase 4: Terminal Integration** (combined panel)
+  - Session panel **embeds the only `TerminalPanel` instance** — replaces the
+    bare terminal panel registration in `zed.rs`
+  - Layout: collapsible sidebar (sessions list) + embedded TerminalPanel,
+    bottom dock by default; sidebar can be toggled to make the panel act
+    exactly like the bare terminal panel
+  - Click a session → spawns `pty-server attach` as a tab in the embedded
+    terminal panel
+- [x] **Reattach state replay** — tmux-style with one-up
+  - vt100 virtual terminal in the daemon tracks live screen state
+  - Hybrid history: `main_log` byte buffer for shell scrollback (recorded
+    only when *not* in alt-screen, so TUI redraws don't pollute history) +
+    vt100's `contents_formatted` overlay when reattaching to a TUI app
+  - On reattach: replay shell history first, then layer alt-screen via
+    `\x1b[?1049h` if a TUI is running. Exiting the TUI naturally drops
+    back to shell history — strictly better than tmux which always wraps
+    the whole session in alt-screen
+  - Per-session `.state` (full snapshot) and `.scrollback` (alt-screen
+    flattened to plain text) files persisted every 5s + on graceful exit
+- [x] **Frozen-state resume**
+  - Click a dead session → daemon resumes via preset, prior `.scrollback`
+    is replayed as scrollback above the fresh shell prompt
+  - `pty-server view <state>` subcommand for read-only inspection
+- [x] **stdin filter in attach client**
+  - Strips terminal-response CSI sequences (DA1, DECRPM, cursor-position
+    reports) so they never reach the daemon's PTY where they'd get echoed
+    back as visible junk in scrollback
 
 ### Next
-- [ ] **Phase 3: Session Panel UI**
-- [ ] **Phase 4: Terminal Integration**
-- [ ] **Phase 5: Remote Integration**
+- [ ] **Phase 5: Remote Integration** (SSH via `zed-remote-server`)
+- [ ] **Phase 6: Polish** (keybindings, search, drag-and-drop, settings)
 
 ## Key Design Decisions
 
@@ -98,8 +130,10 @@ as a dependency of remote_server:
 ### Upstream compatibility
 95% of work is in new crates. Existing Zed code touched:
 - `Cargo.toml` — 2 lines (workspace member + dependency)
-- `crates/zed/src/zed.rs` — 1 line (register session panel)
-- `crates/remote_server/Cargo.toml` — 1 line (add pty_server dep)
+- `crates/zed/src/main.rs` — 1 line (`session_panel::init(cx);`)
+- `crates/zed/src/zed.rs` — ~5 lines (register session panel, drop the
+  standalone `terminal_panel` registration since session panel embeds it)
+- `crates/remote_server/Cargo.toml` — 1 line (add pty_server dep, future)
 - Rebase strategy: weekly onto upstream/main, conflict surface is tiny
 
 ### Folder-based workspacing (not repo-scoped)
@@ -112,36 +146,30 @@ as a dependency of remote_server:
 ### `crates/pty_server/` (done)
 PTY persistence library + CLI. Modules:
 - `protocol.rs` — Wire format: versioned packets (content/attach/detach/resize/exit)
-- `server.rs` — PTY holder: fork, openpty, poll loop, multi-client unix socket
-- `client.rs` — Attach to session socket, raw terminal mode, byte bridge
+- `server.rs` — PTY holder: fork, openpty, poll loop, multi-client unix socket,
+  vt100 virtual terminal + main_log byte buffer (`History` type), atomic
+  `.state`/`.scrollback` persistence
+- `client.rs` — Attach to session socket, raw terminal mode, byte bridge,
+  stdin filter that strips terminal-response CSI sequences
 - `metadata.rs` — Groups, sessions, agent presets, JSON persistence, status refresh
 
-### `crates/session_panel/` (next)
-Zed sidebar panel:
-- Implements `Panel` trait (like ProjectPanel)
-- Tree view: Groups > Sessions with status indicators
-- Actions: create group, add session (pick agent preset), rename, archive, kill
-- Click to attach session in terminal area
-- Agent preset picker on new session
-- Refresh timer to update session statuses
+### `crates/session_panel/` (done)
+Combined session panel + terminal panel. Single `SessionPanel` struct that:
+- Owns a `SessionStore` for groups/sessions/presets
+- Owns the only `Entity<TerminalPanel>` in the workspace (replaces
+  Zed's standalone terminal panel registration)
+- Renders a horizontal split: collapsible session-list sidebar +
+  embedded TerminalPanel
+- Click a session entry → spawns `pty-server attach` as a tab in the
+  embedded terminal panel
+- Click a dead session → resumes via preset, replays prior `.scrollback`
+  as plain-text scrollback above the fresh shell prompt
+- **+** opens an agent preset picker; auto-names new sessions and
+  spawns the daemon immediately
 
 ## Implementation Phases
 
-### Phase 3: Session Panel UI (next)
-- New crate implementing `Panel` trait
-- Tree view with groups and sessions
-- Create group (name + path), add session (name + preset)
-- Click to focus/attach session in terminal area
-- Status indicators (running/idle/dead)
-- Right-click context menu (rename, kill, archive, resume dead session)
-
-### Phase 4: Terminal Integration
-- Modify Zed's terminal spawn to optionally attach to a pty_server session
-- Zed terminal runs `pty-server attach <id>` or calls library directly
-- Reattach on Zed startup for known live sessions
-- Dead session detection → auto-resume using agent preset strategy
-
-### Phase 5: Remote Integration
+### Phase 5: Remote Integration (next)
 - Add pty_server as dependency of remote_server crate
 - Expose session create/attach/list/kill as RPC commands
 - Session panel works identically for local and remote projects
@@ -153,6 +181,9 @@ Zed sidebar panel:
 - Drag-and-drop reordering within groups
 - Settings integration (default preset, socket dir, etc.)
 - Custom agent preset definitions in user config
+- Orphaned-daemon adoption UI (enumerate sockets in socket dir, cross-
+  reference with our JSON, offer to adopt or kill)
+- Process renaming for daemon (so `pkill zed` doesn't sweep daemons)
 
 ## License
 
